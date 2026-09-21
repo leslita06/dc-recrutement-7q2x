@@ -1,0 +1,69 @@
+name: Déploiement admin.diaspora-connect.africa
+
+# Le back office est une page statique chiffrée : toute poussée sur production
+# la met en ligne. Le déclenchement manuel reste possible depuis Actions.
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+
+concurrency:
+  group: mise-en-ligne-back-office-recrutement
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Mise en ligne
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Récupère le dépôt
+        uses: actions/checkout@v4
+
+      - name: Vérifie que la page est complète et chiffrée
+        run: |
+          taille=$(wc -c < index.html)
+          echo "index.html : $taille octets"
+          # Une page tronquée mettrait en ligne un back office vide.
+          [ "$taille" -gt 50000 ] || { echo "::error::index.html anormalement petit"; exit 1; }
+          grep -q '</html>' index.html || { echo "::error::index.html tronqué"; exit 1; }
+          # Garde-fou : publier cette page en clair exposerait les dossiers.
+          grep -q 'AES-GCM' index.html || { echo "::error::charge chiffrée absente"; exit 1; }
+          grep -q 'PBKDF2' index.html || { echo "::error::dérivation de clé absente"; exit 1; }
+
+      - name: Prépare la clé SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.VPS_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Envoie la page
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'README.md' \
+            --exclude '.well-known' \
+            -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes" \
+            ./ \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}"
+
+      # .well-known est exclu du --delete : certbot y dépose les fichiers de
+      # validation lors du renouvellement du certificat.
+
+      - name: Vérifie l'empreinte de la page déposée
+        run: |
+          local_sum=$(sha256sum index.html | cut -d' ' -f1)
+          distant=$(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "sha256sum '${{ secrets.VPS_PATH }}index.html'" | cut -d' ' -f1)
+          if [ "$local_sum" != "$distant" ]; then
+            echo "::error::La page en ligne diffère de celle du dépôt."
+            echo "dépôt   : $local_sum"
+            echo "serveur : $distant"
+            exit 1
+          fi
+          echo "Empreinte identique : la page en ligne est bien celle du dépôt."
